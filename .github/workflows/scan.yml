@@ -1,0 +1,44 @@
+name: Scan Gate - Security
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tool: [semgrep, snyk, trivy, checkov, gitleaks, zap]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run scanner - ${{ matrix.tool }}
+        run: |
+          case "${{ matrix.tool }}" in
+            semgrep) semgrep --config=sec/semgrep-rules --sarif --json -o reports/semgrep.sarif ;;
+            trivy) trivy fs --format sarif -o reports/trivy.sarif . || true ;;
+            checkov) checkov -d . --framework terraform --output sarif > reports/checkov.sarif || true ;;
+            gitleaks) gitleaks detect --source . --report-path=reports/gitleaks.json || true ;;
+            snyk) snyk test --json > reports/snyk.json || true ;;
+            zap) echo "DAST: run in separate job or during e2e" ;;
+          esac
+      - name: Upload reports (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-reports
+          path: reports/
+  policy-eval:
+    needs: scan-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: name: scan-reports
+      - name: Merge reports and evaluate OPA
+        run: |
+          python3 sec/merge_reports.py reports/ > reports/merged.json
+          opa eval -i reports/merged.json -d sec/policies/ "data.policy.deny" --format pretty || true
+      - name: Fail if deny
+        run: |
+          result=$(opa eval -i reports/merged.json -d sec/policies/ 'data.policy.deny' --format json)
+          if [ "$(echo $result | jq length)" -gt 0 ]; then
+            echo "Policy denies merge"; exit 1
+          fi
